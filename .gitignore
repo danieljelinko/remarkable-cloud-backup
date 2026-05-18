@@ -1,0 +1,16 @@
+# backed-up data — never commit
+260517_remarkable_data_backup/
+remarkable-backup-*/
+*.rmdoc
+remarkable-manifest-*.txt
+remarkable-manifest-*.json
+
+# Python / uv
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# env
+.env
