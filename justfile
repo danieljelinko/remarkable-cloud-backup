@@ -35,6 +35,12 @@ recent days="7":
 recent-download days="7" out=".":
     uv run rmbackup.py recent --days {{days}} --out "{{out}}" --download
 
+# Prepare a notebook for text extraction (renders pages for Claude Code to read)
+# Accepts a cloud path or a local .rmdoc file
+# Example: just inspect "/Work/Meeting notes"
+inspect path:
+    uv run rmbackup.py inspect "{{path}}"
+
 # Run test suite
 test:
     uv run pytest tests/ -v

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import zipfile
 import re
 import shutil
 import subprocess
@@ -579,6 +580,125 @@ def _print_report(report: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Inspect — prepare a .rmdoc for reading by Claude Code
+# ---------------------------------------------------------------------------
+
+def _pdf_to_text(pdf_path: Path) -> str:
+    """Extract embedded text from a PDF using pdftotext."""
+    r = subprocess.run(
+        ["pdftotext", str(pdf_path), "-"],
+        capture_output=True, text=True, timeout=60,
+    )
+    return r.stdout.strip()
+
+
+def _rmc_to_markdown(rm_files: list[Path]) -> str:
+    """Convert .rm files to markdown using rmc (typed text / highlights only)."""
+    parts = []
+    for rm in rm_files:
+        r = subprocess.run(
+            ["rmc", "-f", "rm", "-t", "markdown", str(rm)],
+            capture_output=True, text=True, timeout=30,
+        )
+        text = r.stdout.strip()
+        if text and text not in ("# Highlights", "#"):
+            parts.append(text)
+    return "\n\n---\n\n".join(parts)
+
+
+def _geta_rendered_pdf(cloud_path: str, dest_dir: Path) -> Path | None:
+    """Download a cloud-rendered PDF via `rmapi geta`."""
+    before = set(dest_dir.glob("*.pdf"))
+    subprocess.run(
+        [rmapi_path()],
+        input=f'geta "{cloud_path}"\nexit\n',
+        capture_output=True, text=True,
+        cwd=str(dest_dir), timeout=300,
+    )
+    after = set(dest_dir.glob("*.pdf"))
+    return next(iter(after - before), None)
+
+
+def _pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 150) -> list[Path]:
+    """Rasterise a PDF to PNG images (one per page) using pdftoppm."""
+    prefix = out_dir / "page"
+    subprocess.run(
+        ["pdftoppm", "-r", str(dpi), "-png", str(pdf_path), str(prefix)],
+        capture_output=True, timeout=120,
+    )
+    return sorted(out_dir.glob("page-*.png"))
+
+
+def prepare_inspect(
+    rmdoc_path: Path,
+    out_dir: Path,
+    cloud_path: str | None = None,
+) -> dict:
+    """
+    Prepare a .rmdoc for inspection by Claude Code.
+
+    Returns a dict describing what was produced:
+      {
+        "type":       "text" | "images" | "mixed",
+        "text":       str | None,      # embedded text if found
+        "text_file":  str | None,      # path to saved text file
+        "images":     [str, ...],      # paths to rendered page PNGs
+        "rmc_text":   str | None,      # typed/highlighted content via rmc
+      }
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="rminspect_") as tmp:
+        tmp_dir = Path(tmp)
+        with zipfile.ZipFile(rmdoc_path) as zf:
+            zf.extractall(tmp_dir)
+
+        pdf_files = list(tmp_dir.rglob("*.pdf"))
+        rm_files  = list(tmp_dir.rglob("*.rm"))
+
+        result: dict = {"text": None, "text_file": None, "images": [], "rmc_text": None}
+
+        # --- Embedded PDF: extract text ---
+        pdf_text = _pdf_to_text(pdf_files[0]) if pdf_files else ""
+        if len(pdf_text) > 100:
+            text_file = out_dir / "text.txt"
+            text_file.write_text(pdf_text)
+            result["text"] = pdf_text
+            result["text_file"] = str(text_file)
+
+        # --- .rm files: rmc for typed/highlighted content ---
+        rmc_text = _rmc_to_markdown(rm_files) if rm_files else ""
+        if rmc_text:
+            result["rmc_text"] = rmc_text
+
+        # --- Handwriting: render to images ---
+        # Only render if we don't have good embedded text
+        if len(pdf_text) < 100:
+            source_pdf: Path | None = None
+
+            # Best: get cloud-rendered PDF via geta
+            if cloud_path and check_auth():
+                print("  Fetching cloud-rendered PDF via geta…", flush=True)
+                source_pdf = _geta_rendered_pdf(cloud_path, tmp_dir)
+
+            # Fall back: use embedded PDF (if any, even without text)
+            if source_pdf is None and pdf_files:
+                source_pdf = pdf_files[0]
+
+            if source_pdf:
+                print("  Rendering pages to images…", flush=True)
+                images = _pdf_to_images(source_pdf, out_dir)
+                result["images"] = [str(p) for p in images]
+
+        result["type"] = (
+            "mixed" if (result["text"] and result["images"]) else
+            "text"  if result["text"] else
+            "images"
+        )
+        return result
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -628,6 +748,44 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     print(f"size     : {size_mb:.0f} MB")
     print(f"status   : {report['status']}")
     return 0 if report["status"] == "ok" else 1
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(args.out_dir) if args.out_dir else Path(tempfile.mkdtemp(prefix=f"rminspect_{stamp}_"))
+
+    cloud_path: str | None = None
+    rmdoc_path: Path | None = None
+
+    candidate = Path(args.path)
+    if candidate.suffix == ".rmdoc" and candidate.exists():
+        rmdoc_path = candidate
+    else:
+        cloud_path = args.path
+        print(f"Fetching {cloud_path!r}…")
+        fetch_dir = Path(tempfile.mkdtemp(prefix="rmfetch_"))
+        downloaded = _rmapi_get(cloud_path, fetch_dir)
+        if not downloaded:
+            print(f"ERROR: could not fetch {cloud_path!r}", file=sys.stderr)
+            return 1
+        rmdoc_path = downloaded
+
+    print(f"Preparing content in {out_dir} …")
+    result = prepare_inspect(rmdoc_path, out_dir, cloud_path=cloud_path)
+
+    # Print a machine-readable + human summary
+    print(json.dumps(result, indent=2))
+    print()
+    if result["text"]:
+        print(f"Embedded text saved to: {result['text_file']}")
+    if result["rmc_text"]:
+        print("Typed/highlighted content (rmc):")
+        print(result["rmc_text"])
+    if result["images"]:
+        print(f"{len(result['images'])} page image(s) ready for Claude Code to read:")
+        for p in result["images"]:
+            print(f"  {p}")
+    return 0
 
 
 def _cmd_fetch(args: argparse.Namespace) -> int:
@@ -708,6 +866,15 @@ def main() -> int:
     p_recent.add_argument("--download", action="store_true", help="Download the listed files")
     p_recent.add_argument("--out", default=".", help="Download destination (default: current dir)")
 
+    p_inspect = sub.add_parser(
+        "inspect",
+        help="Prepare a notebook for text extraction (renders pages for Claude Code to read)",
+    )
+    p_inspect.add_argument("path", help="Cloud path or local .rmdoc file")
+    p_inspect.add_argument(
+        "--out-dir", help="Directory to save rendered images / text (default: auto temp dir)"
+    )
+
     args = parser.parse_args()
     dispatch = {
         "install": _cmd_install,
@@ -717,6 +884,7 @@ def main() -> int:
         "manifest": _cmd_manifest,
         "fetch": _cmd_fetch,
         "recent": _cmd_recent,
+        "inspect": _cmd_inspect,
     }
     return dispatch[args.cmd](args)
 

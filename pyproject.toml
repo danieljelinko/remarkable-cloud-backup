@@ -3,7 +3,14 @@ name = "remarkable-cloud-backup"
 version = "0.1.0"
 description = "Bulletproof reMarkable cloud library backup tool"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic>=0.104.0",
+]
+
+[project.optional-dependencies]
+inspect = [
+    "anthropic>=0.104.0",
+]
 
 [dependency-groups]
 dev = [
