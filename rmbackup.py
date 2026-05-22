@@ -607,7 +607,7 @@ def _rmc_to_markdown(rm_files: list[Path]) -> str:
 
 
 def _geta_rendered_pdf(cloud_path: str, dest_dir: Path) -> Path | None:
-    """Download a cloud-rendered PDF via `rmapi geta`."""
+    """Download a cloud-rendered PDF via `rmapi geta` (fallback for unsupported .rm versions)."""
     before = set(dest_dir.glob("*.pdf"))
     subprocess.run(
         [rmapi_path()],
@@ -629,21 +629,51 @@ def _pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 150) -> list[Path]:
     return sorted(out_dir.glob("page-*.png"))
 
 
+def _rm_to_png(rm_path: Path, out_path: Path, dpi: int = 150) -> bool:
+    """
+    Render a single .rm file to PNG locally:
+      .rm → SVG (rmc) → PNG (ImageMagick convert)
+    Returns True on success.
+    """
+    svg_path = out_path.with_suffix(".svg")
+
+    r = subprocess.run(
+        ["rmc", "-f", "rm", "-t", "svg", str(rm_path), "-o", str(svg_path)],
+        capture_output=True, timeout=30,
+    )
+    if r.returncode != 0 or not svg_path.exists() or svg_path.stat().st_size < 200:
+        return False
+
+    r2 = subprocess.run(
+        ["convert", "-density", str(dpi), "-background", "white",
+         "-flatten", str(svg_path), str(out_path)],
+        capture_output=True, timeout=60,
+    )
+    svg_path.unlink(missing_ok=True)
+    return r2.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
+
+
 def prepare_inspect(
     rmdoc_path: Path,
     out_dir: Path,
     cloud_path: str | None = None,
+    dpi: int = 150,
 ) -> dict:
     """
     Prepare a .rmdoc for inspection by Claude Code.
 
-    Returns a dict describing what was produced:
+    Rendering priority for handwritten notebooks:
+      1. Local: rmc → SVG → ImageMagick PNG  (no auth, no cloud)
+      2. Cloud fallback: rmapi geta → pdftoppm PNG  (needs auth)
+
+    Returns:
       {
-        "type":       "text" | "images" | "mixed",
-        "text":       str | None,      # embedded text if found
-        "text_file":  str | None,      # path to saved text file
-        "images":     [str, ...],      # paths to rendered page PNGs
-        "rmc_text":   str | None,      # typed/highlighted content via rmc
+        "type":      "text" | "images" | "mixed",
+        "text":      str | None,
+        "text_file": str | None,
+        "images":    [str, ...],
+        "rmc_text":  str | None,
+        "render":    "local" | "cloud" | "none",
       }
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -654,11 +684,14 @@ def prepare_inspect(
             zf.extractall(tmp_dir)
 
         pdf_files = list(tmp_dir.rglob("*.pdf"))
-        rm_files  = list(tmp_dir.rglob("*.rm"))
+        rm_files  = sorted(tmp_dir.rglob("*.rm"))
 
-        result: dict = {"text": None, "text_file": None, "images": [], "rmc_text": None}
+        result: dict = {
+            "text": None, "text_file": None,
+            "images": [], "rmc_text": None, "render": "none",
+        }
 
-        # --- Embedded PDF: extract text ---
+        # --- Embedded PDF: text extraction ---
         pdf_text = _pdf_to_text(pdf_files[0]) if pdf_files else ""
         if len(pdf_text) > 100:
             text_file = out_dir / "text.txt"
@@ -666,34 +699,46 @@ def prepare_inspect(
             result["text"] = pdf_text
             result["text_file"] = str(text_file)
 
-        # --- .rm files: rmc for typed/highlighted content ---
+        # --- .rm files: typed/highlighted content via rmc ---
         rmc_text = _rmc_to_markdown(rm_files) if rm_files else ""
         if rmc_text:
             result["rmc_text"] = rmc_text
 
-        # --- Handwriting: render to images ---
-        # Only render if we don't have good embedded text
-        if len(pdf_text) < 100:
-            source_pdf: Path | None = None
+        # --- Handwriting rendering (only if no good embedded text) ---
+        if len(pdf_text) < 100 and rm_files:
+            images: list[Path] = []
 
-            # Best: get cloud-rendered PDF via geta
-            if cloud_path and check_auth():
-                print("  Fetching cloud-rendered PDF via geta…", flush=True)
-                source_pdf = _geta_rendered_pdf(cloud_path, tmp_dir)
+            # Path 1 — local render: rmc SVG → ImageMagick PNG
+            print("  Rendering pages locally (rmc → SVG → PNG)…", flush=True)
+            for i, rm in enumerate(rm_files, 1):
+                out_png = out_dir / f"page-{i:03d}.png"
+                if _rm_to_png(rm, out_png, dpi=dpi):
+                    images.append(out_png)
 
-            # Fall back: use embedded PDF (if any, even without text)
-            if source_pdf is None and pdf_files:
-                source_pdf = pdf_files[0]
+            if images:
+                result["render"] = "local"
+            else:
+                # Path 2 — cloud fallback: geta → pdftoppm
+                print("  Local render failed, trying cloud geta…", flush=True)
+                if cloud_path and check_auth():
+                    source_pdf = _geta_rendered_pdf(cloud_path, tmp_dir)
+                    if source_pdf:
+                        images = _pdf_to_images(source_pdf, out_dir, dpi=dpi)
+                        if images:
+                            result["render"] = "cloud"
+                elif pdf_files:
+                    # Last resort: render embedded PDF (annotations only)
+                    images = _pdf_to_images(pdf_files[0], out_dir, dpi=dpi)
+                    if images:
+                        result["render"] = "local"
 
-            if source_pdf:
-                print("  Rendering pages to images…", flush=True)
-                images = _pdf_to_images(source_pdf, out_dir)
-                result["images"] = [str(p) for p in images]
+            result["images"] = [str(p) for p in images]
 
         result["type"] = (
-            "mixed" if (result["text"] and result["images"]) else
-            "text"  if result["text"] else
-            "images"
+            "mixed"  if (result["text"] and result["images"]) else
+            "text"   if result["text"] else
+            "images" if result["images"] else
+            "none"
         )
         return result
 
