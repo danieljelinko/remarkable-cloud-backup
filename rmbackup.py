@@ -23,6 +23,8 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -339,6 +341,117 @@ def retry_network_errors(
 
 
 # ---------------------------------------------------------------------------
+# Fetch single file
+# ---------------------------------------------------------------------------
+
+def fetch_file(cloud_path: str, out_dir: Path) -> Path | None:
+    """
+    Download a single file from the reMarkable cloud to out_dir.
+    Handles eCryptFS filename truncation automatically.
+    Returns the local Path on success, None on failure.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ecryptfs = is_ecryptfs(out_dir)
+
+    with tempfile.TemporaryDirectory(prefix="rmapi_fetch_") as tmp:
+        tmp_dir = Path(tmp)
+        downloaded = _rmapi_get(cloud_path, tmp_dir)
+        if not downloaded:
+            return None
+
+        if ecryptfs:
+            stem = truncate_utf8(downloaded.stem, ECRYPTFS_SAFE_BYTES - 6)
+            name = f"{stem}.rmdoc"
+        else:
+            name = downloaded.name
+
+        dest = out_dir / name
+        shutil.move(str(downloaded), str(dest))
+        return dest
+
+
+# ---------------------------------------------------------------------------
+# List files with timestamps (for "recent" queries)
+# ---------------------------------------------------------------------------
+
+def ls_json(cloud_dir: str) -> list[dict]:
+    """
+    Run `rmapi -json ls <cloud_dir>`. Returns list of entry dicts.
+    Each dict has at minimum: VissibleName, Type, ModifiedClient.
+    Returns [] on error or auth failure.
+    """
+    result = subprocess.run(
+        [rmapi_path(), "-json", "ls", cloud_dir],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def list_recent(days: int = 7, root: str = "/", max_workers: int = 8) -> list[dict]:
+    """
+    Return cloud file entries modified within the last N days, newest first.
+
+    Strategy: one `rmapi find` call to enumerate directories, then one
+    `rmapi -json ls <dir>` per unique directory in parallel — O(dirs) not O(files).
+
+    Each returned dict contains:
+      _cloud_path  : full cloud path string
+      _modified_dt : datetime (UTC)
+      VissibleName : display name from cloud
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # Get all file paths to discover which directories exist
+    find_result = subprocess.run(
+        [rmapi_path(), "find", root],
+        capture_output=True, text=True, timeout=120,
+    )
+    dirs: set[str] = set()
+    for line in find_result.stdout.splitlines():
+        if line.startswith("[f] "):
+            parent = str(Path(line[4:]).parent)
+            dirs.add("/" if parent in (".", "/") else parent)
+
+    if not dirs:
+        return []
+
+    recent: list[dict] = []
+
+    def fetch_dir(d: str) -> list[dict]:
+        entries = ls_json(d)
+        results = []
+        for e in entries:
+            if e.get("Type") != "DocumentType":
+                continue
+            ts_str = e.get("ModifiedClient", "")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.rstrip("Z")).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                e["_modified_dt"] = ts
+                name = e.get("VissibleName", "")
+                e["_cloud_path"] = f"{d.rstrip('/')}/{name}"
+                results.append(e)
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_dir, d) for d in dirs]
+        for future in as_completed(futures):
+            recent.extend(future.result())
+
+    return sorted(recent, key=lambda x: x["_modified_dt"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 
@@ -517,6 +630,46 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "ok" else 1
 
 
+def _cmd_fetch(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out).expanduser().resolve()
+    print(f"Fetching: {args.path}")
+    result = fetch_file(args.path, out_dir)
+    if result:
+        print(f"Saved: {result}")
+        return 0
+    print(f"ERROR: could not download {args.path!r}", file=sys.stderr)
+    return 1
+
+
+def _cmd_recent(args: argparse.Namespace) -> int:
+    print(f"Scanning for files modified in the last {args.days} day(s)…")
+    entries = list_recent(days=args.days)
+
+    if not entries:
+        print("No recently modified files found.")
+        return 0
+
+    print(f"\nFound {len(entries)} file(s):\n")
+    for e in entries:
+        ts = e["_modified_dt"].strftime("%Y-%m-%d %H:%M UTC")
+        print(f"  {ts}  {e['_cloud_path']}")
+
+    if args.download:
+        out_dir = Path(args.out).expanduser().resolve()
+        print(f"\nDownloading to {out_dir}…")
+        ok = 0
+        for e in entries:
+            saved = fetch_file(e["_cloud_path"], out_dir)
+            if saved:
+                print(f"  OK  {saved.name}")
+                ok += 1
+            else:
+                print(f"  FAIL  {e['_cloud_path']}", file=sys.stderr)
+        print(f"\nDownloaded {ok}/{len(entries)}")
+
+    return 0
+
+
 def _cmd_manifest(args: argparse.Namespace) -> int:
     out = Path(args.out).expanduser().resolve() if args.out else Path(f"manifest-{time.strftime('%Y%m%d')}.txt")
     count = get_manifest(out)
@@ -546,6 +699,15 @@ def main() -> int:
     p_manifest = sub.add_parser("manifest", help="Capture cloud manifest only")
     p_manifest.add_argument("--out", help="Output file path")
 
+    p_fetch = sub.add_parser("fetch", help="Download a single file by cloud path")
+    p_fetch.add_argument("path", help="Cloud path (e.g. /Work/Meeting notes)")
+    p_fetch.add_argument("--out", default=".", help="Local output directory (default: current dir)")
+
+    p_recent = sub.add_parser("recent", help="List (and optionally download) recently modified files")
+    p_recent.add_argument("--days", type=int, default=7, help="Look back N days (default: 7)")
+    p_recent.add_argument("--download", action="store_true", help="Download the listed files")
+    p_recent.add_argument("--out", default=".", help="Download destination (default: current dir)")
+
     args = parser.parse_args()
     dispatch = {
         "install": _cmd_install,
@@ -553,6 +715,8 @@ def main() -> int:
         "backup": _cmd_backup,
         "verify": _cmd_verify,
         "manifest": _cmd_manifest,
+        "fetch": _cmd_fetch,
+        "recent": _cmd_recent,
     }
     return dispatch[args.cmd](args)
 

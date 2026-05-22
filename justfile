@@ -22,6 +22,19 @@ verify:
 manifest:
     uv run rmbackup.py manifest --out {{data_dir}}/manifest-`date +%Y%m%d`.txt
 
+# Fetch a single file by cloud path (quote paths with spaces)
+# Example: just fetch "/Work/Meeting notes"
+fetch path out=".":
+    uv run rmbackup.py fetch "{{path}}" --out "{{out}}"
+
+# List files modified in the last N days (default 7)
+recent days="7":
+    uv run rmbackup.py recent --days {{days}}
+
+# List and download files modified in the last N days
+recent-download days="7" out=".":
+    uv run rmbackup.py recent --days {{days}} --out "{{out}}" --download
+
 # Run test suite
 test:
     uv run pytest tests/ -v

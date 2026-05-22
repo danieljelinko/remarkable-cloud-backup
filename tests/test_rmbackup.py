@@ -1,7 +1,9 @@
 """Tests for rmbackup.py — no network calls, no rmapi binary required."""
 
+import json
 import shutil
 import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -201,6 +203,131 @@ def test_verify_backup_no_manifest(tmp_path):
     result = rmbackup.verify_backup(backup, None)
     assert result["manifest_count"] is None
     assert result["file_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# full_backup orchestration (mocked)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ls_json
+# ---------------------------------------------------------------------------
+
+LS_JSON_OUTPUT = json.dumps([
+    {
+        "ID": "abc1", "VissibleName": "My Notes", "Type": "DocumentType",
+        "ModifiedClient": "2026-05-20T10:00:00Z", "ModifiedServer": "2026-05-20T10:01:00Z",
+        "Parent": "", "Version": 3,
+    },
+    {
+        "ID": "abc2", "VissibleName": "Subfolder", "Type": "CollectionType",
+        "ModifiedClient": "2026-05-18T08:00:00Z", "ModifiedServer": "2026-05-18T08:01:00Z",
+        "Parent": "", "Version": 1,
+    },
+])
+
+def test_ls_json_parses_output():
+    with patch("rmbackup.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=LS_JSON_OUTPUT)
+        entries = rmbackup.ls_json("/")
+    assert len(entries) == 2
+    assert entries[0]["VissibleName"] == "My Notes"
+
+def test_ls_json_returns_empty_on_error():
+    with patch("rmbackup.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        assert rmbackup.ls_json("/") == []
+
+def test_ls_json_returns_empty_on_bad_json():
+    with patch("rmbackup.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="not json")
+        assert rmbackup.ls_json("/") == []
+
+
+# ---------------------------------------------------------------------------
+# list_recent
+# ---------------------------------------------------------------------------
+
+# All files in root so only one ls_json call is made
+FIND_OUTPUT = "[f] /My Notes\n[f] /Old Doc\n"
+
+def test_list_recent_filters_by_date():
+    recent_entry = {
+        "ID": "x1", "VissibleName": "My Notes", "Type": "DocumentType",
+        "ModifiedClient": "2026-05-21T10:00:00Z",  # 1 day before cutoff → inside window
+    }
+    old_entry = {
+        "ID": "x2", "VissibleName": "Old Doc", "Type": "DocumentType",
+        "ModifiedClient": "2026-05-01T10:00:00Z",  # 21 days before cutoff → outside window
+    }
+
+    with (
+        patch("rmbackup.subprocess.run") as mock_run,
+        patch("rmbackup.ls_json", return_value=[recent_entry, old_entry]),
+        patch("rmbackup.datetime") as mock_dt,
+    ):
+        fixed_now = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.now.return_value = fixed_now
+        mock_dt.fromisoformat.side_effect = datetime.fromisoformat
+        mock_run.return_value = MagicMock(returncode=0, stdout=FIND_OUTPUT)
+
+        results = rmbackup.list_recent(days=7)
+
+    assert len(results) == 1
+    assert results[0]["VissibleName"] == "My Notes"
+
+def test_list_recent_empty_when_no_files():
+    with patch("rmbackup.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        results = rmbackup.list_recent(days=7)
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_file
+# ---------------------------------------------------------------------------
+
+def test_fetch_file_success(tmp_path):
+    cloud_path = "/Work/Meeting notes"
+    fake_download = tmp_path / "tmp_dl"
+    fake_download.mkdir()
+    fake_file = fake_download / "Meeting notes.rmdoc"
+    fake_file.write_bytes(b"rmdoc content")
+
+    with (
+        patch("rmbackup._rmapi_get", return_value=fake_file),
+        patch("rmbackup.is_ecryptfs", return_value=False),
+    ):
+        result = rmbackup.fetch_file(cloud_path, tmp_path / "out")
+
+    assert result is not None
+    assert result.suffix == ".rmdoc"
+    assert result.exists()
+
+def test_fetch_file_truncates_on_ecryptfs(tmp_path):
+    long_name = "A" * 200
+    cloud_path = f"/folder/{long_name}"
+    fake_download = tmp_path / "tmp_dl"
+    fake_download.mkdir()
+    fake_file = fake_download / f"{long_name}.rmdoc"
+    fake_file.write_bytes(b"x")
+
+    with (
+        patch("rmbackup._rmapi_get", return_value=fake_file),
+        patch("rmbackup.is_ecryptfs", return_value=True),
+    ):
+        result = rmbackup.fetch_file(cloud_path, tmp_path / "out")
+
+    assert result is not None
+    assert len(result.name.encode("utf-8")) <= rmbackup.ECRYPTFS_SAFE_BYTES
+
+def test_fetch_file_returns_none_on_failure(tmp_path):
+    with (
+        patch("rmbackup._rmapi_get", return_value=None),
+        patch("rmbackup.is_ecryptfs", return_value=False),
+    ):
+        result = rmbackup.fetch_file("/some/file", tmp_path)
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
