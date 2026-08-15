@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["rmc>=0.3"]
 # ///
 """
 reMarkable Cloud Backup — rmbackup.py
@@ -428,9 +428,9 @@ def list_recent(days: int = 7, root: str = "/", max_workers: int = 8) -> list[di
         entries = ls_json(d)
         results = []
         for e in entries:
-            if e.get("Type") != "DocumentType":
+            if (e.get("type") or e.get("Type")) != "DocumentType":  # v0.0.34 lowercases keys
                 continue
-            ts_str = e.get("ModifiedClient", "")
+            ts_str = e.get("modifiedClient") or e.get("ModifiedClient", "")
             if not ts_str:
                 continue
             try:
@@ -439,7 +439,7 @@ def list_recent(days: int = 7, root: str = "/", max_workers: int = 8) -> list[di
                 continue
             if ts >= cutoff:
                 e["_modified_dt"] = ts
-                name = e.get("VissibleName", "")
+                name = e.get("name") or e.get("VissibleName", "")
                 e["_cloud_path"] = f"{d.rstrip('/')}/{name}"
                 results.append(e)
         return results
@@ -577,6 +577,134 @@ def _print_report(report: dict) -> None:
         for p in report["long_name_failed"] + report["network_failed"]:
             print(f"  {p}")
     print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Incremental backup — only files changed since the last full backup
+# ---------------------------------------------------------------------------
+
+def find_last_full_backup(data_dir: Path) -> tuple[Path, datetime] | None:
+    """Return (dir, utc_ts) of the newest `remarkable-backup-YYYYMMDD-HHMMSS` under `data_dir`, or None."""
+    best: tuple[Path, datetime] | None = None
+    for d in Path(data_dir).glob("remarkable-backup-*"):
+        m = re.match(r"remarkable-backup-(\d{8})-(\d{6})$", d.name)
+        if not m or not d.is_dir(): continue
+        ts = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        if best is None or ts > best[1]: best = (d, ts)
+    return best
+
+
+def incremental_backup(data_dir: Path, out_dir: Path | None = None, days: int | None = None) -> dict:
+    """
+    Download only files modified since the last full backup.
+
+    Auto-detects the look-back window from the newest `remarkable-backup-*` dir under
+    `data_dir` unless `days` is given. Saves changed files into `out_dir`
+    (default: `<data_dir>/incremental-<stamp>`). Returns a report dict.
+    """
+    last = find_last_full_backup(data_dir)
+    if days is None:
+        if last is None:
+            raise RuntimeError(f"No previous full backup found under {data_dir}; run a full backup first or pass --days")
+        days = (datetime.now(timezone.utc) - last[1]).days + 1  # +1 day margin so the boundary is not missed
+
+    entries = list_recent(days=days)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(out_dir).expanduser() if out_dir else Path(data_dir) / f"incremental-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ok, failed = 0, []
+    for e in entries:
+        if fetch_file(e["_cloud_path"], out_dir): ok += 1
+        else:                                     failed.append(e["_cloud_path"])
+
+    return {
+        "since": last[1].isoformat() if last else None,
+        "since_dir": str(last[0]) if last else None,
+        "days": days, "found": len(entries),
+        "downloaded": ok, "failed": failed, "out_dir": str(out_dir),
+        "entries": [{"path": e["_cloud_path"], "modified": e["_modified_dt"].isoformat()} for e in entries],
+    }
+
+
+# ---------------------------------------------------------------------------
+# SVG conversion — .rmdoc pages → SVG (v3/v5 via vendored rm2svg, v6 via rmc)
+# ---------------------------------------------------------------------------
+
+def rm_version(rm_path: Path) -> int | None:
+    """Return the `.lines` format version (3/5/6) from an `.rm` file header, or None if not a lines file."""
+    header = Path(rm_path).read_bytes()[:43].decode("latin-1", errors="replace")
+    m = re.search(r"reMarkable \.lines file, version=(\d+)", header)
+    return int(m.group(1)) if m else None
+
+
+def page_order(content_path: Path) -> list[str]:
+    """Return ordered page-UUID list from a `.content` file (v6 `cPages.pages` or legacy `pages`)."""
+    c = json.loads(Path(content_path).read_text())
+    pages = (c.get("cPages", {}) or {}).get("pages") or c.get("pages") or []
+    return [p["id"] if isinstance(p, dict) else p for p in pages]
+
+
+def order_rm_pages(order: list[str], rm_ids: list[str]) -> list[str]:
+    """
+    Order annotation-layer uuids by document page order, appending any not referenced
+    by `order` (some `.content` variants name `.rm` files by a uuid absent from `pages`).
+    Never drops a layer.
+    """
+    have = set(rm_ids)
+    in_order = [pid for pid in order if pid in have]
+    rest = sorted(rid for rid in rm_ids if rid not in set(order))
+    return in_order + rest
+
+
+def _v6_page_to_svg(rm_path: Path, svg_path: Path) -> None:
+    """Convert a v6 `.rm` page to SVG via rmc, injecting the highlighter colour rmc omits (KeyError 9)."""
+    import rmc.exporters.writing_tools as wt
+    from rmscene.scene_items import PenColor
+    wt.RM_PALETTE.setdefault(PenColor.HIGHLIGHT, (247, 232, 81))
+    from rmc.exporters.svg import rm_to_svg
+    rm_to_svg(str(rm_path), str(svg_path))
+
+
+def _v5_page_to_svg(rm_path: Path, svg_path: Path) -> None:
+    """Convert a v3/v5 `.rm` page to SVG via the vendored+patched rm2svg."""
+    from vendor.rm2svg import rm2svg
+    rm2svg(str(rm_path), str(svg_path))
+
+
+def rmdoc_to_svg(rmdoc_path: Path, out_dir: Path) -> dict:
+    """
+    Convert every stroke page of a `.rmdoc` to SVG, one file per page in reading order.
+
+    v6 pages route through rmc; v3/v5 through the vendored rm2svg. Pages with no `.rm`
+    layer (e.g. un-annotated imported-PDF pages) are skipped. Returns
+    `{"svgs": [Path,...], "has_pdf": bool, "versions": {name: int}}`.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = rmdoc_path.stem
+
+    with tempfile.TemporaryDirectory(prefix="rmsvg_") as tmp:
+        tmp_dir = Path(tmp)
+        with zipfile.ZipFile(rmdoc_path) as zf: zf.extractall(tmp_dir)
+
+        content = next(tmp_dir.glob("*.content"), None)
+        has_pdf = bool(list(tmp_dir.rglob("*.pdf")))
+        rm_by_id = {p.stem: p for p in tmp_dir.rglob("*.rm")}
+        order = page_order(content) if content else []
+        ordered = order_rm_pages(order, list(rm_by_id))  # every layer, in page order, none dropped
+
+        svgs, versions = [], {}
+        for i, pid in enumerate(ordered, 1):
+            rm = rm_by_id[pid]
+            v = rm_version(rm)
+            svg_path = out_dir / f"{stem}_page{i}.svg"
+            if   v == 6:        _v6_page_to_svg(rm, svg_path)
+            elif v in (3, 5):   _v5_page_to_svg(rm, svg_path)
+            else: continue                          # unknown/blank layer
+            svgs.append(svg_path); versions[svg_path.name] = v
+
+    return {"svgs": svgs, "has_pdf": has_pdf, "versions": versions}
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +1001,88 @@ def _cmd_recent(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_incremental(args: argparse.Namespace) -> int:
+    if not check_rmapi():
+        print("rmapi not found — run: uv run rmbackup.py install", file=sys.stderr)
+        return 1
+    if not check_auth():
+        print("Not authenticated. Start rmapi and enter your one-time code from:", file=sys.stderr)
+        print("  https://my.remarkable.com/device/browser?showOtp=true", file=sys.stderr)
+        return 1
+
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    out_dir = Path(args.out).expanduser().resolve() if args.out else None
+    try:
+        report = incremental_backup(data_dir, out_dir=out_dir, days=args.days)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    since = report["since"] or "(explicit --days)"
+    print(f"Since last backup : {since}  ({report['days']}-day window)")
+    print(f"Modified files    : {report['found']}")
+    for e in report["entries"]:
+        print(f"  {e['modified'][:16].replace('T', ' ')}  {e['path']}")
+    print(f"Downloaded        : {report['downloaded']}/{report['found']} → {report['out_dir']}")
+    for f in report["failed"]:
+        print(f"  FAIL {f}", file=sys.stderr)
+    return 0 if not report["failed"] else 1
+
+
+def _pdf_page_count(pdf_path: Path) -> int:
+    """Return the page count of a PDF via pdfinfo, or 0 if unreadable/empty."""
+    r = subprocess.run(["pdfinfo", str(pdf_path)], capture_output=True, text=True, timeout=30)
+    m = re.search(r"^Pages:\s+(\d+)", r.stdout, re.MULTILINE)
+    return int(m.group(1)) if m else 0
+
+
+def _cmd_svg(args: argparse.Namespace) -> int:
+    candidate = Path(args.path)
+    cloud_path: str | None = None
+    if candidate.suffix == ".rmdoc" and candidate.exists():
+        rmdoc_path = candidate
+    else:
+        cloud_path = args.path
+        if not check_auth():
+            print("Not authenticated (needed to fetch from cloud). Run rmapi to authenticate.", file=sys.stderr)
+            return 1
+        print(f"Fetching {cloud_path!r}…")
+        rmdoc_path = _rmapi_get(cloud_path, Path(tempfile.mkdtemp(prefix="rmfetch_")))
+        if not rmdoc_path:
+            print(f"ERROR: could not fetch {cloud_path!r}", file=sys.stderr)
+            return 1
+
+    out_dir = Path(args.out).expanduser().resolve() if args.out else Path(f"{rmdoc_path.stem}.svg.d").resolve()
+    result = rmdoc_to_svg(rmdoc_path, out_dir)
+    for s in result["svgs"]:
+        print(f"  {s.name}  (v{result['versions'][s.name]})")
+    print(f"{len(result['svgs'])} page SVG(s) → {out_dir}")
+
+    if result["has_pdf"] and not result["svgs"] and cloud_path:
+        print("  Note: this cloud fetch contained no annotation layers (.rm) — rmapi `get` sometimes", file=sys.stderr)
+        print("        omits them. Convert the local backup .rmdoc instead to get the strokes.", file=sys.stderr)
+
+    if result["has_pdf"]:
+        merged_ok = False
+        if cloud_path and check_auth():
+            print("Annotated PDF — attempting reMarkable cloud render (strokes over PDF)…")
+            zips_before = set(out_dir.glob("*.zip"))
+            merged = _geta_rendered_pdf(cloud_path, out_dir)
+            for junk in set(out_dir.glob("*.zip")) - zips_before: junk.unlink(missing_ok=True)  # geta drops the raw .zip
+            if merged and merged.exists() and _pdf_page_count(merged) > 0:
+                dest = out_dir / f"{rmdoc_path.stem}_annotated.pdf"
+                if merged != dest: merged.replace(dest)
+                print(f"  Merged annotated PDF → {dest}")
+                merged_ok = True
+            elif merged:
+                merged.unlink(missing_ok=True)
+        if not merged_ok:
+            print("  Strokes-only SVGs written (no PDF background overlay).")
+            print("  reMarkable cloud render (`rmapi geta`) is currently unavailable.")
+            print("  For a merged view: my.remarkable.com → open doc → ⋯ → Download as PDF.")
+    return 0
+
+
 def _cmd_manifest(args: argparse.Namespace) -> int:
     out = Path(args.out).expanduser().resolve() if args.out else Path(f"manifest-{time.strftime('%Y%m%d')}.txt")
     count = get_manifest(out)
@@ -920,6 +1130,26 @@ def main() -> int:
         "--out-dir", help="Directory to save rendered images / text (default: auto temp dir)"
     )
 
+    p_incremental = sub.add_parser(
+        "incremental", help="Download only files modified since the last full backup"
+    )
+    p_incremental.add_argument(
+        "--data-dir", default=".",
+        help="Dir holding remarkable-backup-* subdirs (auto-detects the last backup); default: current dir",
+    )
+    p_incremental.add_argument(
+        "--days", type=int, help="Override look-back window (default: auto from last backup date)"
+    )
+    p_incremental.add_argument(
+        "--out", help="Download destination (default: <data-dir>/incremental-<stamp>)"
+    )
+
+    p_svg = sub.add_parser(
+        "svg", help="Convert a notebook's pages to SVG (v5/v6); overlay strokes on PDF for annotated docs"
+    )
+    p_svg.add_argument("path", help="Cloud path or local .rmdoc file")
+    p_svg.add_argument("--out", help="Output dir for SVGs (default: <name>.svg.d)")
+
     args = parser.parse_args()
     dispatch = {
         "install": _cmd_install,
@@ -930,6 +1160,8 @@ def main() -> int:
         "fetch": _cmd_fetch,
         "recent": _cmd_recent,
         "inspect": _cmd_inspect,
+        "incremental": _cmd_incremental,
+        "svg": _cmd_svg,
     }
     return dispatch[args.cmd](args)
 

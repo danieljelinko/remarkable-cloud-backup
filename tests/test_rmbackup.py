@@ -276,6 +276,34 @@ def test_list_recent_filters_by_date():
     assert len(results) == 1
     assert results[0]["VissibleName"] == "My Notes"
 
+def test_list_recent_detects_modified_when_rmapi_uses_camelcase_schema():
+    # Given rmapi >=0.0.34 emits camelCase keys (type/modifiedClient/name), not the old capitalized schema
+    recent_entry = {
+        "id": "x1", "name": "My Notes", "type": "DocumentType",
+        "modifiedClient": "2026-05-21T10:00:00Z",  # 1 day before cutoff → inside window
+    }
+    old_entry = {
+        "id": "x2", "name": "Old Doc", "type": "DocumentType",
+        "modifiedClient": "2026-05-01T10:00:00Z",  # 21 days before cutoff → outside window
+    }
+
+    # When we list files modified in the last 7 days
+    with (
+        patch("rmbackup.subprocess.run") as mock_run,
+        patch("rmbackup.ls_json", return_value=[recent_entry, old_entry]),
+        patch("rmbackup.datetime") as mock_dt,
+    ):
+        fixed_now = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.now.return_value = fixed_now
+        mock_dt.fromisoformat.side_effect = datetime.fromisoformat
+        mock_run.return_value = MagicMock(returncode=0, stdout=FIND_OUTPUT)
+
+        results = rmbackup.list_recent(days=7)
+
+    # Then the camelCase entry inside the window is detected and its path built from `name`
+    assert len(results) == 1
+    assert results[0]["_cloud_path"] == "/My Notes"
+
 def test_list_recent_empty_when_no_files():
     with patch("rmbackup.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout="")
@@ -367,3 +395,126 @@ def test_full_backup_integration(tmp_path):
     m_verify.assert_called_once()
 
     assert report["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# rm_version — .rm lines-file version detection
+# ---------------------------------------------------------------------------
+
+def _write_rm(path: Path, version: int) -> Path:
+    path.write_bytes(f"reMarkable .lines file, version={version}          ".encode() + b"\x00\x01")
+    return path
+
+def test_rm_version_returns_5_when_header_is_v5(tmp_path):
+    # Given an .rm file with a version=5 lines header
+    rm = _write_rm(tmp_path / "page.rm", 5)
+
+    # When we read its version
+    result = rmbackup.rm_version(rm)
+
+    # Then it reports 5
+    assert result == 5
+
+def test_rm_version_returns_6_when_header_is_v6(tmp_path):
+    # Given an .rm file with a version=6 lines header
+    rm = _write_rm(tmp_path / "page.rm", 6)
+
+    # When we read its version
+    result = rmbackup.rm_version(rm)
+
+    # Then it reports 6
+    assert result == 6
+
+def test_rm_version_returns_none_when_not_a_lines_file(tmp_path):
+    # Given a file that is not a reMarkable lines file
+    rm = tmp_path / "page.rm"
+    rm.write_bytes(b"%PDF-1.4 not a lines file")
+
+    # When we read its version
+    result = rmbackup.rm_version(rm)
+
+    # Then it reports None
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# page_order — ordered page UUIDs from a .content file
+# ---------------------------------------------------------------------------
+
+def test_page_order_reads_v6_cpages_ids(tmp_path):
+    # Given a v6 .content file whose cPages.pages carry id dicts
+    content = tmp_path / "doc.content"
+    content.write_text(json.dumps({"cPages": {"pages": [{"id": "aaa"}, {"id": "bbb"}]}}))
+
+    # When we read the page order
+    result = rmbackup.page_order(content)
+
+    # Then the ids come back in order
+    assert result == ["aaa", "bbb"]
+
+def test_page_order_reads_legacy_pages_list(tmp_path):
+    # Given a legacy .content file with a flat pages list of UUID strings
+    content = tmp_path / "doc.content"
+    content.write_text(json.dumps({"pages": ["xxx", "yyy", "zzz"]}))
+
+    # When we read the page order
+    result = rmbackup.page_order(content)
+
+    # Then the UUIDs come back in order
+    assert result == ["xxx", "yyy", "zzz"]
+
+
+# ---------------------------------------------------------------------------
+# find_last_full_backup — newest dated backup dir under a data dir
+# ---------------------------------------------------------------------------
+
+def test_find_last_full_backup_returns_newest_when_multiple(tmp_path):
+    # Given a data dir holding two dated backup subdirs
+    (tmp_path / "remarkable-backup-20260101-000000").mkdir()
+    (tmp_path / "remarkable-backup-20260517-214421").mkdir()
+
+    # When we find the last full backup
+    found = rmbackup.find_last_full_backup(tmp_path)
+
+    # Then it returns the newest dir with its parsed UTC timestamp
+    assert found is not None
+    d, ts = found
+    assert d.name == "remarkable-backup-20260517-214421"
+    assert ts == datetime(2026, 5, 17, 21, 44, 21, tzinfo=timezone.utc)
+
+def test_find_last_full_backup_returns_none_when_absent(tmp_path):
+    # Given a data dir with no dated backup subdirs
+    (tmp_path / "incremental-since-260517").mkdir()
+
+    # When we find the last full backup
+    found = rmbackup.find_last_full_backup(tmp_path)
+
+    # Then there is nothing to return
+    assert found is None
+
+
+# ---------------------------------------------------------------------------
+# order_rm_pages — select+order annotation layers, never dropping any
+# ---------------------------------------------------------------------------
+
+def test_order_rm_pages_orders_by_page_order_when_ids_match(tmp_path):
+    # Given a page order and .rm layers whose uuids are a subset of it
+    order = ["p1", "p2", "p3"]
+    rm_ids = ["p3", "p1"]
+
+    # When we order the annotation layers
+    result = rmbackup.order_rm_pages(order, rm_ids)
+
+    # Then they follow the document's page order
+    assert result == ["p1", "p3"]
+
+def test_order_rm_pages_keeps_layers_when_uuids_not_in_page_order(tmp_path):
+    # Given .rm layers named by uuids absent from the page-id list (a real format variant)
+    order = ["q1", "q2", "q3", "q4"]
+    rm_ids = ["ann-b", "ann-a"]
+
+    # When we order the annotation layers
+    result = rmbackup.order_rm_pages(order, rm_ids)
+
+    # Then no layer is dropped (they are kept, deterministically sorted)
+    assert result == ["ann-a", "ann-b"]

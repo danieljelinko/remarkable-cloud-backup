@@ -5,6 +5,7 @@ description = "Bulletproof reMarkable cloud library backup tool"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.104.0",
+    "rmc>=0.3.0",
 ]
 
 [project.optional-dependencies]

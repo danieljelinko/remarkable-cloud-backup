@@ -41,6 +41,17 @@ recent-download days="7" out=".":
 inspect path:
     uv run rmbackup.py inspect "{{path}}"
 
+# Incremental backup: only files changed since the last full backup in data_dir
+# Auto-detects the window from the newest remarkable-backup-* dir; override with days=N
+incremental days="" out="":
+    uv run rmbackup.py incremental --data-dir {{data_dir}} {{ if days == "" { "" } else { "--days " + days } }} {{ if out == "" { "" } else { "--out " + out } }}
+
+# Convert a notebook's pages to SVG (cloud path or local .rmdoc)
+# Annotated PDFs also get a cloud-rendered strokes-over-PDF when given a cloud path
+# Example: just svg "/Logo"   |   just svg "./Logo.rmdoc" out=~/svgs
+svg path out="":
+    uv run rmbackup.py svg "{{path}}" {{ if out == "" { "" } else { "--out " + out } }}
+
 # Run test suite
 test:
     uv run pytest tests/ -v
