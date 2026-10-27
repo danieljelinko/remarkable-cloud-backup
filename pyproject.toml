@@ -16,4 +16,8 @@ inspect = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ruff>=0.16.0",
 ]
+
+[tool.ruff.lint]
+ignore = ["I001", "ISC004", "FURB167"]   # house style: see .ruler/1007_ruff_linting.md
